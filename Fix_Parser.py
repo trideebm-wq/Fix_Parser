@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import json
+import datetime
 
 # -----------------------------------------------------------------------------
 # CONSTANTS & DICTIONARIES
@@ -13,158 +13,148 @@ FIX_DICTIONARY = {
     "15": "Currency", "22": "IDSource", "48": "SecurityID", "1": "Account",
     "150": "ExecType", "39": "OrdStatus", "37": "OrderID", "17": "ExecID",
     "32": "LastShares", "31": "LastPx", "151": "LeavesQty", "14": "CumQty",
-    "6": "AvgPx", "790": "AllocReportID", "70": "AllocID", "78": "NoAllocs",
-    "79": "AllocAccount", "80": "AllocQty"
+    "6": "AvgPx", "790": "AllocReportID", "70": "AllocID", "78": "NoAllocs"
 }
 
 MSG_TYPES = {
     "0": "Heartbeat", "1": "Test Request", "2": "Resend Request", 
     "3": "Reject", "4": "Sequence Reset", "5": "Logout", 
     "8": "Execution Report", "D": "New Order Single", "9": "Order Cancel Reject",
-    "G": "Order Cancel/Replace Request", "F": "Order Cancel Request", 
-    "J": "Allocation Instruction", "W": "Market Data Snapshot"
+    "G": "Order Cancel/Replace Request", "F": "Order Cancel Request", "J": "Allocation Instruction"
 }
 
-SIDE_TYPES = {"1": "BUY / TAKE", "2": "SELL / GIVE"}
+SIDE_TYPES = {"1": "BUY", "2": "SELL", "3": "BUY PROFILE", "4": "SELL SHORT"}
+ORD_STATUS_TYPES = {"0": "New", "1": "Partially Filled", "2": "Filled", "8": "Rejected"}
 
-# Pre-packaged Mock Scenarios
-SCENARIOS = {
-    "1. Clean STP Pass": "8=FIX.4.4|9=145|35=8|49=CLSA_SG|56=CITI_HK|34=101|52=20260824-10:00:00|11=CLORD12345|37=ORD98765|17=EXEC001|150=2|39=2|55=USD/HKD|54=1|38=5000000|44=7.8020|15=HKD|",
-    "2. FX Block Trade (Valid Allocations)": "8=FIX.4.4|9=210|35=J|49=BLACKROCK_NY|56=HSBC_HK|34=882|52=20260824-11:15:00|790=REP99182|55=EUR/USD|54=1|38=10000000|15=USD|78=3|79=FUND_APAC_A|80=5000000|79=FUND_EM_B|80=3000000|79=FUND_GLO_C|80=2000000|",
-    "3. FX Block Trade (ALLOCATION MISMATCH BREAK)": "8=FIX.4.4|9=210|35=J|49=PIMCO_LN|56=CITI_SG|34=883|52=20260824-11:18:22|790=REP99183|55=GBP/USD|54=2|38=15000000|15=USD|78=2|79=SUB_ACC_01|80=8000000|79=SUB_ACC_02|80=6000000|",
-    "4. Front Office Validation Break (Missing Price)": "8=FIX.4.4|9=120|35=D|49=HSBC_HK|56=UBS_SG|34=402|52=20260824-10:15:30|11=CLORD55555|55=USD/JPY|54=2|38=2500000|40=2|15=JPY|60=20260824-10:15:29|"
-}
+MOCK_RAW_STRINGS = [
+    # Clean trade
+    "8=FIX.4.4 9=145 35=8 49=CLSA_SG 56=CITI_HK 34=101 52=20260821-10:00:00 11=CLORD12345 37=ORD98765 17=EXEC001 150=2 39=2 55=0005.HK 54=1 38=50000 44=65.50 32=50000 31=65.50 151=0 14=50000 6=65.50 15=HKD ",
+    # Exception: Missing Price on Limit Order
+    "8=FIX.4.4 9=120 35=D 49=HSBC_HK 56=UBS_SG 34=402 52=20260821-10:15:30 11=CLORD55555 55=700.HK 54=2 38=10000 40=2 15=HKD 60=20260821-10:15:29 ",
+    # Exception: Currency / Symbol Mismatch (US T-Bill in EUR)
+    "8=FIX.4.4 9=135 35=8 49=BEAR_STEARNS 56=CITI_SG 34=789 52=20260821-10:20:12 11=CLORD999 37=ORD111 17=EXEC002 150=0 39=0 55=US912828ZS88 54=1 38=1000000 44=98.25 15=EUR ",
+    # Exception: Quantity Mismatch (CumQty + LeavesQty != OrderQty)
+    "8=FIX.4.4 9=150 35=8 49=CLSA_SG 56=HSBC_HK 34=102 52=20260821-10:22:00 11=CLORD12346 37=ORD98766 17=EXEC003 150=1 39=1 55=9988.HK 54=1 38=20000 44=92.10 32=5000 31=92.10 151=10000 14=5000 6=92.10 15=HKD "
+]
 
 # -----------------------------------------------------------------------------
-# CORE PARSING ENGINE
+# HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
-def parse_fix_to_structured_data(fix_string: str):
-    """Parses raw FIX string into standard tag-value dictionary and handles repeating allocation groups."""
+def parse_fix_to_dict(fix_string: str) -> dict:
+    """Parses raw FIX string using SOH delimiter (standardized to pipe or visual block)."""
+    # Standardize common delimiters to a common split token
     normalized = fix_string.replace(" ", "|").replace("^A", "|").replace(";", "|")
     pairs = [p for p in normalized.split("|") if "=" in p]
     
-    flat_tags = {}
-    allocations = []
-    
-    current_alloc_acc = None
-    
+    parsed = {}
     for pair in pairs:
         tag, val = pair.split("=", 1)
-        tag, val = tag.strip(), val.strip()
-        
-        # Look for repeating FX allocation blocks (Tags 79 & 80)
-        if tag == "79":
-            current_alloc_acc = val
-        elif tag == "80" and current_alloc_acc:
-            allocations.append({"Allocation Account": current_alloc_acc, "Allocated Volume": float(val)})
-            current_alloc_acc = None
-        else:
-            flat_tags[tag] = val
-            
-    return flat_tags, allocations
+        parsed[tag.strip()] = val.strip()
+    return parsed
 
-def validate_trade_flows(fields: dict, allocs: list) -> list:
-    """Business Analyst Rule Engine mapping industry cross-validation rules."""
+def run_exception_engine(parsed_fields: dict) -> list:
+    """Business Analyst Rule Engine mapping industry validation criteria."""
     exceptions = []
-    msg_type = fields.get("35")
     
+    # Rule 1: Message Type Check
+    msg_type = parsed_fields.get("35")
     if not msg_type:
         exceptions.append("CRITICAL: Missing MsgType (Tag 35)")
         return exceptions
 
-    # Rule 1: Limit Order Check
-    if fields.get("40") == "2" and not fields.get("44"):
-        exceptions.append("BUSINESS RULE: Order Type is 'Limit' (Tag 40=2) but explicit Price (Tag 44) is missing.")
+    # Rule 2: Limit Order missing explicit price
+    ord_type = parsed_fields.get("40")
+    if ord_type == "2" and not parsed_fields.get("44"):
+        exceptions.append("BUSINESS RULE: Order Type is 'Limit' (Tag 40=2) but Price (Tag 44) is missing.")
 
-    # Rule 2: Dynamic Currency Pair Integrity
-    symbol = fields.get("55", "")
-    currency = fields.get("15", "")
-    if "/" in symbol and currency:
-        base_ccy, terms_ccy = symbol.split("/", 1)
-        if currency != terms_ccy:
-            exceptions.append(f"STATIC DATA BREAK: FX Cross '{symbol}' settles in '{terms_ccy}', but execution currency is set to '{currency}'.")
+    # Rule 3: Static Data Cross-Validation (Symbol & Currency Logic)
+    symbol = parsed_fields.get("55", "")
+    currency = parsed_fields.get("15", "")
+    if ".HK" in symbol and currency != "HKD":
+        exceptions.append(f"STATIC DATA BREAK: Asset '{symbol}' implies Hong Kong market, but Settlement Currency is '{currency}'.")
+    if symbol.startswith("US") and len(symbol) == 12 and currency not in ["USD", ""]:
+        exceptions.append(f"STATIC DATA BREAK: CUSIP/ISIN '{symbol}' implies US Market Treasury/Fixed Income, but Currency is '{currency}'.")
 
-    # Rule 3: Repeating Block Allocation Engine (Tag 78, 79, 80 validation)
-    if msg_type == "J" or len(allocs) > 0:
-        total_block_qty = float(fields.get("38", 0))
-        declared_num_allocs = int(fields.get("78", 0))
-        actual_num_allocs = len(allocs)
-        sum_allocated_qty = sum(item["Allocated Volume"] for item in allocs)
+    # Rule 4: Post-Trade State Machine Check (Execution Reports Lifecycle)
+    if msg_type == "8":
+        order_qty = pd.to_numeric(parsed_fields.get("38", 0), errors='coerce')
+        cum_qty = pd.to_numeric(parsed_fields.get("14", 0), errors='coerce')
+        leaves_qty = pd.to_numeric(parsed_fields.get("151", 0), errors='coerce')
         
-        if declared_num_allocs != actual_num_allocs:
-            exceptions.append(f"REPEATING GROUP ERROR: Tag 78 declares {declared_num_allocs} allocations, but processed exactly {actual_num_allocs} details.")
-            
-        if total_block_qty != sum_allocated_qty:
-            variance = total_block_qty - sum_allocated_qty
-            exceptions.append(f"ALLOCATION BALANCING BREAK: Block OrderQty ({total_block_qty:,.0f}) does not match Sum of Sub-Allocations ({sum_allocated_qty:,.0f}). Out of balance by: {variance:,.0f}.")
-            
+        if (cum_qty + leaves_qty) != order_qty:
+            exceptions.append(f"POST-TRADE BREAK: Mathematical mismatch. OrderQty ({order_qty}) != CumQty ({cum_qty}) + LeavesQty ({leaves_qty}).")
+
     return exceptions
 
 # -----------------------------------------------------------------------------
-# USER INTERFACE LAYOUT
+# APPLICATION UI LAYOUT
 # -----------------------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="FIX FX Block Allocation Engine")
+st.set_page_config(layout="wide", page_title="FIX Protocol Exception Engine")
 
-st.title("📟 Front-to-Back FIX Protocol Parsing & FX Block Allocation Engine")
+st.title("📟 Front-to-Back FIX Protocol Parsing & Exception Engine")
 st.markdown("""
 **Author:** Trideeb Mukherjee — Senior Project Manager & Business Analyst (22 Years Exp Banking & FICC IT)  
-*This modular sandbox parses raw infrastructure logs, maps repeating allocation matrices, and highlights mid-office exceptions.*
+*This proof-of-concept simulates middle-office validations across Trade Capture, DMA Execution, and Clearing flows.*
 """)
 
-# Dashboard Input Section
-col_left, col_right = st.columns([1.2, 1])
+col_left, col_right = st.columns([1, 1])
 
 with col_left:
-    st.subheader("📥 Input Layer: Raw FX Fix Log")
-    scenario_selection = st.selectbox("Inject Pre-Configured Capital Market Scenarios:", options=list(SCENARIOS.keys()))
+    st.subheader("📥 Input Layer: Raw FIX Stream")
     
+    # Load Quick Mock Samples
+    sample_choice = st.selectbox(
+        "Select a Pre-configured Production Scenario:",
+        options=["-- Direct User Custom Input --", "1. STP Execution Report (Clean Pass)", "2. New Order Single (Front Office Validation Break)", "3. FICC Treasury Booking (Currency Mismatch)", "4. Clearing & Settlement Flow (Post-Trade State Break)"]
+    )
+    
+    default_text = ""
+    if "1." in sample_choice: default_text = MOCK_RAW_STRINGS[0]
+    elif "2." in sample_choice: default_text = MOCK_RAW_STRINGS[1]
+    elif "3." in sample_choice: default_text = MOCK_RAW_STRINGS[2]
+    elif "4." in sample_choice: default_text = MOCK_RAW_STRINGS[3]
+
     raw_fix_input = st.text_area(
-        "Raw String Stream Console (Supports SOH, pipe '|', or semicolon ';'):",
-        value=SCENARIOS[scenario_selection],
-        height=140
+        "Paste Raw FIX String here (Supports SOH, pipe '|', or semicolon ';' separators):",
+        value=default_text,
+        placeholder="8=FIX.4.4|9=120|35=D|...",
+        height=180
     )
 
 with col_right:
     st.subheader("🎯 Operations Room: Exception Desk")
     if raw_fix_input:
-        dict_fields, list_allocations = parse_fix_to_structured_data(raw_fix_input)
-        engine_alerts = validate_trade_flows(dict_fields, list_allocations)
+        dict_fields = parse_fix_to_dict(raw_fix_input)
+        engine_alerts = run_exception_engine(dict_fields)
         
         if not engine_alerts:
-            st.success("✅ **STP PROCESSING PASS:** No clearing breaks detected. Message cleared for straight-through-processing downstream.")
+            st.success("✅ **STP PASS:** No systemic exceptions detected. Message ready for straight-through downstream clearing.")
         else:
             for alert in engine_alerts:
-                st.error(f"🚨 {alert}")
+                if "CRITICAL" in alert or "BREAK" in alert:
+                    st.error(f"🚨 {alert}")
+                else:
+                    st.warning(f"⚠️ {alert}")
     else:
         st.info("Awaiting input data stream to run validation rules.")
 
-# Visual Blocks for Allocations if present
-if raw_fix_input and list_allocations:
-    st.markdown("---")
-    st.subheader("📊 Dynamic FX Allocation Component Matrix")
-    st.markdown(f"**Parent Block Total Volume (Tag 38):** `{float(dict_fields.get('38', 0)):,.2f} {dict_fields.get('15','')}`")
-    
-    col_metric1, col_metric2 = st.columns(2)
-    sum_vol = sum(x["Allocated Volume"] for x in list_allocations)
-    target_vol = float(dict_fields.get('38', 0))
-    
-    col_metric1.metric("Sum of Allocated Entities", f"{sum_vol:,.2f}")
-    col_metric2.metric("Unallocated Balance Variance", f"{(target_vol - sum_vol):,.2f}", delta=f"{(target_vol - sum_vol):,.2f}", delta_color="inverse")
-    
-    st.dataframe(pd.DataFrame(list_allocations), use_container_width=True, hide_index=True)
-
-# Human Readable Mapping
+# Detailed Parsing Workspace
 if raw_fix_input and dict_fields:
     st.markdown("---")
-    st.subheader("🔍 Metadata Discovery & Technical Tag Mapping")
+    st.subheader("🔍 Metadata Discovery & Human-Readable Mapping")
     
+    # Transpose parsed fields for a structured ledger table
     ui_table_data = []
     for tag, val in dict_fields.items():
-        tag_desc = FIX_DICTIONARY.get(tag, "Custom / Sub-Schema Field")
+        tag_desc = FIX_DICTIONARY.get(tag, "Custom / Vendor Specific Tag")
+        
+        # Add rich human context definitions
         translated_val = val
         if tag == "35": translated_val = f"{val} ({MSG_TYPES.get(val, 'Unknown')})"
         elif tag == "54": translated_val = f"{val} ({SIDE_TYPES.get(val, 'Unknown')})"
+        elif tag == "39": translated_val = f"{val} ({ORD_STATUS_TYPES.get(val, 'Unknown')})"
             
-        ui_table_data.append({"FIX Tag": tag, "Protocol Definition": tag_desc, "Raw Value": val, "Business Interpretation": translated_val})
+        ui_table_data.append({"FIX Tag": tag, "Protocol Definition": tag_desc, "Raw Component": val, "Interpreted Meaning": translated_val})
         
-    st.dataframe(pd.DataFrame(ui_table_data), use_container_width=True, hide_index=True)
+    df_resolved = pd.DataFrame(ui_table_data)
+    st.dataframe(df_resolved, use_container_width=True, hide_index=True)
